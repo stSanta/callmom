@@ -29,7 +29,15 @@
 
         <p id="hint" class="hint">Откройте ссылки на двух устройствах и нажмите трубку с обеих сторон.</p>
 
-        <audio id="remoteAudio" autoplay playsinline></audio>
+        <button id="audioButton" class="audio-button" type="button" hidden>Включить звук</button>
+        <section class="chat" aria-label="Текстовые сообщения">
+          <div id="chatLog" class="chat-log" aria-live="polite"></div>
+          <form id="chatForm" class="chat-form">
+            <input id="chatInput" maxlength="160" autocomplete="off" placeholder="короткое сообщение" disabled>
+            <button id="chatSend" type="submit" disabled>OK</button>
+          </form>
+        </section>
+        <audio id="remoteAudio" class="remote-audio" autoplay playsinline></audio>
       </section>
     </main>
 

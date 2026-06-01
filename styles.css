@@ -47,7 +47,7 @@ button {
   width: min(100%, 440px);
   min-height: 620px;
   display: grid;
-  grid-template-rows: auto auto 1fr auto auto;
+  grid-template-rows: auto auto 1fr auto auto auto;
   align-items: center;
   gap: 24px;
   padding: 28px;
@@ -273,8 +273,13 @@ h2 {
 }
 
 .call-button.active {
-  background: var(--danger);
+  background: #c92f25;
   box-shadow: 0 18px 42px rgba(180, 51, 42, 0.22);
+}
+
+.call-button.active:hover,
+.call-button.active:focus-visible {
+  background: #9f291f;
 }
 
 .call-button.active svg {
@@ -289,8 +294,96 @@ h2 {
   line-height: 1.45;
 }
 
-audio {
+.audio-button {
+  min-height: 46px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--ink);
+  color: #fff;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.audio-button[hidden] {
   display: none;
+}
+
+.audio-button:hover,
+.audio-button:focus-visible {
+  background: var(--accent-dark);
+  outline: none;
+}
+
+.chat {
+  width: 100%;
+  display: grid;
+  gap: 10px;
+}
+
+.chat-log {
+  min-height: 56px;
+  max-height: 104px;
+  display: grid;
+  align-content: end;
+  gap: 6px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: rgba(244, 247, 243, 0.78);
+}
+
+.chat-line {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.chat-line strong {
+  color: var(--ink);
+}
+
+.chat-form {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+}
+
+.chat-form input {
+  min-height: 42px;
+}
+
+.chat-form button {
+  min-width: 54px;
+  min-height: 42px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--ink);
+  color: #fff;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.chat-form button:disabled {
+  cursor: not-allowed;
+  background: #aebbb3;
+}
+
+.chat-form button:hover:not(:disabled),
+.chat-form button:focus-visible:not(:disabled) {
+  background: var(--accent-dark);
+  outline: none;
+}
+
+.remote-audio {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 @media (max-width: 520px) {

@@ -3,6 +3,7 @@
 
   const PEER_PREFIX = "call-mom-v1";
   const RETRY_DELAY_MS = 2400;
+  const CHAT_RETRY_DELAY_MS = 2500;
   const TAKEOVER_TIMEOUT_MS = 7000;
   const TAKEOVER_RETRY_DELAY_MS = 1300;
   const JITTER_BUFFER_TARGET_SECONDS = 0.8;
@@ -33,6 +34,9 @@
     peer: null,
     localStream: null,
     activeCall: null,
+    chatConnection: null,
+    chatRetryTimer: null,
+    audioContext: null,
     retryTimer: null,
     roomHash: ""
   };
@@ -47,6 +51,11 @@
     secretKey: document.querySelector("#secretKey"),
     personButtons: Array.from(document.querySelectorAll("[data-person]")),
     callButton: document.querySelector("#callButton"),
+    audioButton: document.querySelector("#audioButton"),
+    chatLog: document.querySelector("#chatLog"),
+    chatForm: document.querySelector("#chatForm"),
+    chatInput: document.querySelector("#chatInput"),
+    chatSend: document.querySelector("#chatSend"),
     hint: document.querySelector("#hint"),
     remoteAudio: document.querySelector("#remoteAudio")
   };
@@ -63,6 +72,7 @@
 
   elements.setupForm.addEventListener("submit", (event) => {
     event.preventDefault();
+    unlockAudioOutput();
     confirmSetup();
   });
 
@@ -74,6 +84,8 @@
   });
 
   elements.callButton.addEventListener("click", () => {
+    unlockAudioOutput();
+
     if (state.lifted) {
       endCall("Трубка положена");
       return;
@@ -83,6 +95,15 @@
       console.error(error);
       failCall(error.message || "Не удалось начать звонок", "Проверьте доступ к микрофону и попробуйте снова.");
     });
+  });
+
+  elements.audioButton.addEventListener("click", () => {
+    playRemoteAudio(true);
+  });
+
+  elements.chatForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    sendChatMessage();
   });
 
   window.addEventListener("beforeunload", () => {
@@ -183,10 +204,13 @@
     state.lifted = true;
     state.connected = false;
     state.roomHash = await shortHash(state.key);
+    elements.audioButton.hidden = true;
+    resetChat();
 
     elements.callButton.classList.add("active");
     elements.callButton.disabled = false;
     elements.callButton.setAttribute("aria-label", "Положить трубку");
+    elements.callButton.title = "Положить трубку";
     closeSetup();
     setStatus("waiting", "Запрашиваем микрофон");
     elements.hint.textContent = "Разрешите доступ к микрофону, затем дождитесь второго абонента.";
@@ -199,6 +223,11 @@
       },
       video: false
     });
+
+    const audioTracks = state.localStream.getAudioTracks();
+    if (!audioTracks.length) {
+      throw new Error("Браузер не вернул аудиотрек микрофона.");
+    }
 
     createPeer();
   }
@@ -217,6 +246,7 @@
     state.peer.on("open", () => {
       setStatus("waiting", "Ждем второго абонента");
       elements.hint.textContent = "Связь включена. Зеленая лампочка загорится после соединения.";
+      scheduleChatConnectNow();
       scheduleDialNow();
     });
 
@@ -230,7 +260,11 @@
     });
 
     state.peer.on("connection", (connection) => {
-      attachControlConnection(connection);
+      if (connection.metadata && connection.metadata.type === "takeover") {
+        attachControlConnection(connection);
+      } else {
+        attachChatConnection(connection);
+      }
     });
 
     state.peer.on("disconnected", () => {
@@ -286,6 +320,124 @@
     scheduleDial();
   }
 
+  function scheduleChatConnectNow() {
+    window.clearTimeout(state.chatRetryTimer);
+    connectChat();
+  }
+
+  function scheduleChatConnect() {
+    window.clearTimeout(state.chatRetryTimer);
+    if (!state.lifted || hasOpenChat()) {
+      return;
+    }
+
+    state.chatRetryTimer = window.setTimeout(connectChat, CHAT_RETRY_DELAY_MS);
+  }
+
+  function connectChat() {
+    if (!state.peer || !state.peer.open || hasOpenChat()) {
+      scheduleChatConnect();
+      return;
+    }
+
+    const connection = state.peer.connect(buildPeerId(state.other), {
+      reliable: true,
+      metadata: { type: "chat" }
+    });
+    attachChatConnection(connection);
+    scheduleChatConnect();
+  }
+
+  function attachChatConnection(connection) {
+    if (state.chatConnection && state.chatConnection !== connection) {
+      if (state.chatConnection.open) {
+        connection.close();
+        return;
+      }
+
+      state.chatConnection.close();
+    }
+
+    state.chatConnection = connection;
+
+    connection.on("open", () => {
+      window.clearTimeout(state.chatRetryTimer);
+      enableChat(true);
+      addChatLine("system", "текстовая связь установлена");
+    });
+
+    connection.on("data", (message) => {
+      if (!message || message.type !== "chat") {
+        return;
+      }
+
+      addChatLine("other", message.text);
+    });
+
+    connection.on("close", () => {
+      if (state.chatConnection === connection) {
+        state.chatConnection = null;
+        enableChat(false);
+        if (state.lifted) {
+          addChatLine("system", "текстовая связь прервана");
+          scheduleChatConnect();
+        }
+      }
+    });
+
+    connection.on("error", (error) => {
+      console.error(error);
+      if (state.chatConnection === connection) {
+        state.chatConnection = null;
+      }
+      enableChat(false);
+      if (state.lifted) {
+        scheduleChatConnect();
+      }
+    });
+  }
+
+  function sendChatMessage() {
+    const text = elements.chatInput.value.trim();
+    if (!text || !hasOpenChat()) {
+      return;
+    }
+
+    state.chatConnection.send({ type: "chat", text });
+    addChatLine("me", text);
+    elements.chatInput.value = "";
+    elements.chatInput.focus();
+  }
+
+  function hasOpenChat() {
+    return Boolean(state.chatConnection && state.chatConnection.open);
+  }
+
+  function enableChat(enabled) {
+    elements.chatInput.disabled = !enabled;
+    elements.chatSend.disabled = !enabled;
+  }
+
+  function resetChat() {
+    window.clearTimeout(state.chatRetryTimer);
+    state.chatConnection = null;
+    enableChat(false);
+    elements.chatLog.replaceChildren();
+    addChatLine("system", "текстовая связь ждет второго абонента");
+  }
+
+  function addChatLine(kind, text) {
+    const line = document.createElement("p");
+    line.className = "chat-line";
+
+    const label = document.createElement("strong");
+    label.textContent = kind === "me" ? "Вы: " : kind === "other" ? "Он: " : "";
+    line.append(label, document.createTextNode(text));
+
+    elements.chatLog.append(line);
+    elements.chatLog.scrollTop = elements.chatLog.scrollHeight;
+  }
+
   function attachCall(call, incoming) {
     if (state.activeCall && state.connected) {
       call.close();
@@ -299,15 +451,17 @@
     state.activeCall = call;
 
     call.on("stream", (remoteStream) => {
+      const remoteTracks = remoteStream.getAudioTracks();
       state.connected = true;
       window.clearTimeout(state.retryTimer);
       tuneReceiverBuffer(call);
       elements.remoteAudio.srcObject = remoteStream;
-      elements.remoteAudio.play().catch(() => {
-        elements.hint.textContent = "Нажмите трубку еще раз, если браузер не включил звук автоматически.";
-      });
       setStatus("live", "На линии");
-      elements.hint.textContent = "Можно говорить. Чтобы выйти, просто закройте страницу.";
+      elements.hint.textContent = remoteTracks.length
+        ? "Можно говорить. Если тишина, нажмите «Включить звук»."
+        : "Соединение есть, но входящий аудиотрек не пришел.";
+      elements.audioButton.hidden = !remoteTracks.length;
+      playRemoteAudio(false);
     });
 
     call.on("close", () => {
@@ -332,6 +486,61 @@
         scheduleDial();
       }
     });
+  }
+
+  async function unlockAudioOutput() {
+    elements.remoteAudio.muted = false;
+    elements.remoteAudio.volume = 1;
+
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass) {
+      state.audioContext = state.audioContext || new AudioContextClass();
+      if (state.audioContext.state === "suspended") {
+        try {
+          await state.audioContext.resume();
+        } catch (error) {
+          console.debug("Audio context is still suspended", error);
+        }
+      }
+    }
+
+    if (!elements.remoteAudio.srcObject) {
+      return;
+    }
+
+    try {
+      await elements.remoteAudio.play();
+      elements.audioButton.hidden = !(state.connected && hasRemoteAudioTrack());
+    } catch (error) {
+      console.debug("Audio output is still locked", error);
+    }
+  }
+
+  async function playRemoteAudio(fromUserGesture) {
+    elements.remoteAudio.muted = false;
+    elements.remoteAudio.volume = 1;
+
+    try {
+      await elements.remoteAudio.play();
+      elements.audioButton.hidden = !(state.connected && hasRemoteAudioTrack());
+      if (state.connected) {
+        elements.hint.textContent = "Звук включен. Можно говорить.";
+      }
+    } catch (error) {
+      console.warn("Remote audio playback was blocked", error);
+      elements.audioButton.hidden = false;
+      elements.hint.textContent = fromUserGesture
+        ? "Браузер все еще блокирует звук. Проверьте громкость и разрешения сайта."
+        : "Браузер подключил звонок, но звук нужно включить кнопкой ниже.";
+    }
+  }
+
+  function hasRemoteAudioTrack() {
+    return Boolean(
+      elements.remoteAudio.srcObject &&
+        elements.remoteAudio.srcObject.getAudioTracks &&
+        elements.remoteAudio.srcObject.getAudioTracks().length
+    );
   }
 
   function attachControlConnection(connection) {
@@ -536,7 +745,9 @@
     state.takeoverAttempted = false;
     elements.callButton.classList.remove("active");
     elements.callButton.setAttribute("aria-label", "Снять трубку");
+    elements.callButton.title = "Снять трубку";
     elements.remoteAudio.srcObject = null;
+    elements.audioButton.hidden = true;
     openSetup(message || "Для новой сессии проверьте абонента и код связи.");
   }
 
@@ -547,7 +758,9 @@
     state.takeoverAttempted = false;
     elements.callButton.classList.remove("active");
     elements.callButton.setAttribute("aria-label", "Снять трубку");
+    elements.callButton.title = "Снять трубку";
     elements.remoteAudio.srcObject = null;
+    elements.audioButton.hidden = true;
     elements.callButton.disabled = !canCall();
     setStatus("error", statusText);
     elements.hint.textContent = hintText;
@@ -555,7 +768,14 @@
 
   function cleanup() {
     window.clearTimeout(state.retryTimer);
+    window.clearTimeout(state.chatRetryTimer);
     destroyTakeoverPeer();
+
+    if (state.chatConnection) {
+      state.chatConnection.close();
+      state.chatConnection = null;
+    }
+    enableChat(false);
 
     if (state.activeCall) {
       state.activeCall.close();
@@ -570,6 +790,11 @@
     if (state.localStream) {
       state.localStream.getTracks().forEach((track) => track.stop());
       state.localStream = null;
+    }
+
+    if (elements.remoteAudio.srcObject) {
+      elements.remoteAudio.srcObject.getTracks().forEach((track) => track.stop());
+      elements.remoteAudio.srcObject = null;
     }
   }
 })();
