@@ -11,6 +11,7 @@
   var MAX_AUDIO_IN_FLIGHT = 2;
   var params = readParams();
   var SIGNAL_URL = CONFIG.signalingUrl || "./signal.php";
+  var DEFAULT_KEY = normalizeKey(CONFIG.defaultKey) || "1";
   var AudioContextClass = window.AudioContext || window.webkitAudioContext;
 
   var state = {
@@ -85,11 +86,7 @@
   init();
 
   function init() {
-    var storedPerson = localStorage.getItem("callMomPerson") || "";
-
-    elements.secretKey.value = params.key || "";
-    choosePerson(params.me || storedPerson);
-    openSetup("Проверьте абонента и код связи.");
+    configureFixedLine();
 
     elements.secretKey.addEventListener("input", refreshSetupState);
     elements.setupForm.addEventListener("submit", function (event) {
@@ -106,7 +103,7 @@
 
     elements.callButton.addEventListener("click", function () {
       if (state.lifted) {
-        endCall("Трубка положена. Для новой сессии проверьте абонента и код связи.");
+        endCall("Трубка положена. Можно начать новую сессию этой же кнопкой.");
         return;
       }
 
@@ -127,8 +124,37 @@
       cleanup();
     });
 
+    window.addEventListener("hashchange", function () {
+      if (!state.lifted) {
+        configureFixedLine();
+        updateDebug();
+      }
+    });
+
     refreshSetupState();
     updateDebug();
+  }
+
+  function normalizeKey(value) {
+    if (value === undefined || value === null) {
+      return "";
+    }
+
+    return String(value).trim();
+  }
+
+  function configureFixedLine() {
+    params = readParams();
+    var person = params.me === "2" ? "2" : "1";
+
+    choosePerson(person);
+    state.key = DEFAULT_KEY;
+    state.roomHash = hashString(state.key);
+    state.confirmed = true;
+    elements.secretKey.value = state.key;
+    closeSetup();
+    resetChat();
+    refreshSetupState();
   }
 
   function readParams() {
@@ -166,19 +192,19 @@
   }
 
   function refreshSetupState() {
-    state.key = elements.secretKey.value.trim();
+    state.key = DEFAULT_KEY;
+    state.roomHash = hashString(state.key);
+    state.confirmed = Boolean(state.me && state.key);
+    elements.secretKey.value = state.key;
 
     var ready = Boolean(state.me && state.key);
-    elements.setupSubmit.disabled = !ready;
-    elements.callButton.disabled = !(state.confirmed && ready && !state.lifted);
+    elements.setupSubmit.disabled = true;
+    elements.callButton.disabled = !ready;
     updateDebug();
 
     if (!ready) {
       setStatus("idle", "Нужны абонент и код связи");
-      elements.hint.textContent = "Один код связи должен быть одинаковым на двух устройствах.";
-    } else if (!state.confirmed) {
-      setStatus("idle", "Проверьте настройки");
-      elements.hint.textContent = "Подтвердите абонента и код связи перед звонком.";
+      elements.hint.textContent = "Откройте персональную ссылку абонента 1 или абонента 2.";
     } else if (!state.lifted) {
       setStatus("idle", "Готово");
       elements.hint.textContent = "Нажмите трубку. Второй абонент делает то же самое.";
@@ -186,31 +212,14 @@
   }
 
   function confirmSetup() {
-    if (!state.me || !state.key) {
-      refreshSetupState();
-      return;
-    }
-
-    localStorage.setItem("callMomPerson", state.me);
-    state.roomHash = hashString(state.key);
-    state.confirmed = true;
-    closeSetup();
-    refreshSetupState();
+    configureFixedLine();
     updateDebug();
   }
 
   function openSetup(message) {
-    state.confirmed = false;
-    elements.setupDialog.hidden = false;
-    elements.callButton.disabled = true;
-    resetChat();
+    closeSetup();
     refreshSetupState();
-    elements.hint.textContent = message;
-
-    setTimeout(function () {
-      elements.secretKey.focus();
-      elements.secretKey.select();
-    }, 0);
+    elements.hint.textContent = message || elements.hint.textContent;
   }
 
   function closeSetup() {
@@ -833,7 +842,9 @@
     state.connected = false;
     cleanup();
     setButtonLifted(false);
-    openSetup(message || "Для новой сессии проверьте абонента и код связи.");
+    resetChat();
+    refreshSetupState();
+    elements.hint.textContent = message || "Можно начать новую сессию этой же кнопкой.";
   }
 
   function failCall(status, hint) {
@@ -841,6 +852,8 @@
     state.connected = false;
     cleanup();
     setButtonLifted(false);
+    closeSetup();
+    refreshSetupState();
     setStatus("error", status);
     elements.hint.textContent = hint;
     elements.callButton.disabled = false;
@@ -975,7 +988,7 @@
     }
 
     elements.debugInfo.textContent = [
-      "версия: v23-pull-sync-relay",
+      "версия: v24-fixed-links",
       "режим: серверное двухканальное реле",
       "signalingUrl: " + SIGNAL_URL,
       "абонент: " + (state.me || "не выбран"),
