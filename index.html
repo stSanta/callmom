@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Call Mom</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="shell" aria-live="polite">
+      <section class="panel" aria-labelledby="app-title">
+        <div class="status-row">
+          <span id="lamp" class="lamp lamp-idle" aria-hidden="true"></span>
+          <span id="statusText" class="status-text">Готовимся к звонку</span>
+        </div>
+
+        <div class="identity">
+          <p class="kicker">Прямая линия</p>
+          <h1 id="app-title">Call Mom</h1>
+          <p id="roleText" class="role">Выберите абонента</p>
+        </div>
+
+        <button id="callButton" class="call-button" type="button" aria-label="Снять трубку" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.8 19.8 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.12 4.2 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.12.91.32 1.8.57 2.65a2 2 0 0 1-.45 2.11L8 9.72a16 16 0 0 0 6.28 6.28l1.24-1.23a2 2 0 0 1 2.11-.45c.85.25 1.74.45 2.65.57A2 2 0 0 1 22 16.92Z"></path>
+          </svg>
+        </button>
+
+        <p id="hint" class="hint">Откройте ссылки на двух устройствах и нажмите трубку с обеих сторон.</p>
+
+        <section class="chat" aria-label="Текстовые сообщения">
+          <div id="chatLog" class="chat-log" aria-live="polite"></div>
+          <form id="chatForm" class="chat-form">
+            <input id="chatInput" maxlength="160" autocomplete="off" placeholder="короткое сообщение" disabled>
+            <button id="chatSend" type="submit" disabled>OK</button>
+          </form>
+        </section>
+        <audio id="remoteAudio" class="remote-audio" autoplay playsinline></audio>
+      </section>
+    </main>
+
+    <div id="setupDialog" class="setup-dialog" role="dialog" aria-modal="true" aria-labelledby="setupTitle">
+      <form id="setupForm" class="setup-card">
+        <p class="kicker">Новая сессия</p>
+        <h2 id="setupTitle">Кто на линии?</h2>
+        <div class="field">
+          <label for="secretKey">Код связи</label>
+          <input id="secretKey" autocomplete="off" spellcheck="false" placeholder="один общий секрет">
+        </div>
+        <div class="person-picker" role="group" aria-label="Выбор абонента">
+          <button class="person-button" type="button" data-person="1">Абонент 1</button>
+          <button class="person-button" type="button" data-person="2">Абонент 2</button>
+        </div>
+        <button id="setupSubmit" class="setup-submit" type="submit" disabled>Продолжить</button>
+      </form>
+    </div>
+
+    <script src="./vendor/peerjs.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
