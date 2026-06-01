@@ -357,6 +357,29 @@ h2 {
   outline: none;
 }
 
+.debug {
+  width: 100%;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.debug summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.debug pre {
+  max-height: 130px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: rgba(244, 247, 243, 0.78);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .remote-audio {
   position: absolute;
   width: 1px;
