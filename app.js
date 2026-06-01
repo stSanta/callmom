@@ -2,6 +2,7 @@
   document.documentElement.dataset.peerLoaded = window.Peer ? "true" : "false";
 
   const PEER_PREFIX = "call-mom-v1";
+  const CALLER_PERSON = "1";
   const RETRY_DELAY_MS = 2400;
   const CHAT_RETRY_DELAY_MS = 2500;
   const TAKEOVER_TIMEOUT_MS = 7000;
@@ -33,7 +34,10 @@
     takeoverTimer: null,
     peer: null,
     localStream: null,
+    remoteStream: null,
     activeCall: null,
+    callNegotiating: false,
+    mediaIceState: "new",
     chatConnection: null,
     chatRetryTimer: null,
     audioContext: null,
@@ -244,10 +248,15 @@
     });
 
     state.peer.on("open", () => {
-      setStatus("waiting", "Ждем второго абонента");
-      elements.hint.textContent = "Связь включена. Зеленая лампочка загорится после соединения.";
-      scheduleChatConnectNow();
-      scheduleDialNow();
+      if (isCaller()) {
+        setStatus("waiting", "Ищем второго абонента");
+        elements.hint.textContent = "Связь включена. Зеленая лампочка загорится после сетевого соединения.";
+        scheduleChatConnectNow();
+        scheduleDialNow();
+      } else {
+        setStatus("waiting", "Ждем звонок");
+        elements.hint.textContent = "Связь включена. Абонент 1 подключит аудио и текст.";
+      }
     });
 
     state.peer.on("call", (call) => {
@@ -291,6 +300,7 @@
       if (state.lifted && !state.connected) {
         setStatus("waiting", "Второй абонент еще не на линии");
         scheduleDial();
+        scheduleChatConnect();
       }
     });
   }
@@ -302,7 +312,7 @@
 
   function scheduleDial() {
     window.clearTimeout(state.retryTimer);
-    if (!state.lifted || state.connected) {
+    if (!isCaller() || !state.lifted || state.connected) {
       return;
     }
 
@@ -310,6 +320,15 @@
   }
 
   function dialOther() {
+    if (!isCaller()) {
+      return;
+    }
+
+    if (state.callNegotiating && state.activeCall) {
+      scheduleDial();
+      return;
+    }
+
     if (!state.peer || !state.peer.open || !state.localStream || state.connected) {
       scheduleDial();
       return;
@@ -327,7 +346,7 @@
 
   function scheduleChatConnect() {
     window.clearTimeout(state.chatRetryTimer);
-    if (!state.lifted || hasOpenChat()) {
+    if (!isCaller() || !state.lifted || hasOpenChat()) {
       return;
     }
 
@@ -335,6 +354,10 @@
   }
 
   function connectChat() {
+    if (!isCaller()) {
+      return;
+    }
+
     if (!state.peer || !state.peer.open || hasOpenChat()) {
       scheduleChatConnect();
       return;
@@ -416,6 +439,11 @@
   function enableChat(enabled) {
     elements.chatInput.disabled = !enabled;
     elements.chatSend.disabled = !enabled;
+    elements.chatInput.placeholder = enabled
+      ? "короткое сообщение"
+      : isCaller()
+        ? "ждем текстовую связь"
+        : "ждем абонента 1";
   }
 
   function resetChat() {
@@ -423,7 +451,7 @@
     state.chatConnection = null;
     enableChat(false);
     elements.chatLog.replaceChildren();
-    addChatLine("system", "текстовая связь ждет второго абонента");
+    addChatLine("system", isCaller() ? "текстовая связь ищет второго абонента" : "текстовая связь ждет абонента 1");
   }
 
   function addChatLine(kind, text) {
@@ -439,7 +467,7 @@
   }
 
   function attachCall(call, incoming) {
-    if (state.activeCall && state.connected) {
+    if (state.activeCall && state.activeCall !== call && (state.connected || state.callNegotiating)) {
       call.close();
       return;
     }
@@ -449,32 +477,70 @@
     }
 
     state.activeCall = call;
+    state.callNegotiating = true;
+    state.mediaIceState = "new";
 
     call.on("stream", (remoteStream) => {
       const remoteTracks = remoteStream.getAudioTracks();
-      state.connected = true;
-      window.clearTimeout(state.retryTimer);
-      tuneReceiverBuffer(call);
+      state.remoteStream = remoteStream;
       elements.remoteAudio.srcObject = remoteStream;
-      setStatus("live", "На линии");
+      setStatus("waiting", "Аудиоканал найден");
       elements.hint.textContent = remoteTracks.length
-        ? "Можно говорить. Если тишина, нажмите «Включить звук»."
+        ? "Аудиотрек получен. Ждем сетевое соединение."
         : "Соединение есть, но входящий аудиотрек не пришел.";
-      elements.audioButton.hidden = !remoteTracks.length;
-      playRemoteAudio(false);
+      elements.audioButton.hidden = true;
+
+      if (isIceConnected(state.mediaIceState)) {
+        markCallLive(call);
+      }
+    });
+
+    call.on("iceStateChanged", (iceState) => {
+      state.mediaIceState = iceState;
+
+      if (isIceConnected(iceState)) {
+        markCallLive(call);
+        return;
+      }
+
+      if (iceState === "checking") {
+        setStatus("waiting", "Пробиваем сеть");
+        elements.hint.textContent = "Идет сетевое соединение между городами.";
+      }
+
+      if (iceState === "failed") {
+        state.callNegotiating = false;
+        if (!state.connected) {
+          addChatLine("system", "аудиосеть не соединилась, пробуем резервный путь");
+          setStatus("waiting", "Сеть не пробилась");
+          elements.hint.textContent = isCaller()
+            ? "Пробуем соединиться снова через резервный маршрут."
+            : "Ждем новый звонок от абонента 1.";
+          scheduleDial();
+        }
+      }
+
+      if (iceState === "disconnected" && state.connected) {
+        setStatus("waiting", "Сеть пропала");
+        elements.hint.textContent = "Ждем восстановления соединения.";
+      }
     });
 
     call.on("close", () => {
       if (state.lifted) {
         const wasConnected = state.connected;
         state.connected = false;
+        state.callNegotiating = false;
+        state.remoteStream = null;
         state.activeCall = null;
 
         if (wasConnected) {
           endCall("Связь завершена. Для новой сессии проверьте абонента и код связи.");
         } else {
           setStatus("waiting", "Соединение прервано");
-          elements.hint.textContent = "Оставьте страницу открытой: пробуем соединиться снова.";
+          elements.hint.textContent = isCaller()
+            ? "Оставьте страницу открытой: пробуем соединиться снова."
+            : "Оставьте страницу открытой: ждем новый звонок от абонента 1.";
           scheduleDial();
         }
       }
@@ -482,10 +548,38 @@
 
     call.on("error", (error) => {
       console.error(error);
+      state.callNegotiating = false;
       if (state.lifted && !state.connected) {
         scheduleDial();
       }
     });
+  }
+
+  function markCallLive(call) {
+    if (state.activeCall !== call || state.connected || !state.remoteStream) {
+      return;
+    }
+
+    const remoteTracks = state.remoteStream.getAudioTracks();
+    state.connected = true;
+    state.callNegotiating = false;
+    window.clearTimeout(state.retryTimer);
+    tuneReceiverBuffer(call);
+    setStatus("live", "На линии");
+    addChatLine("system", "аудиосеть соединена");
+    elements.hint.textContent = remoteTracks.length
+      ? "Сеть соединена. Если тишина, нажмите «Включить звук»."
+      : "Сеть соединена, но входящий аудиотрек не пришел.";
+    elements.audioButton.hidden = !remoteTracks.length;
+    playRemoteAudio(false);
+
+    if (isCaller()) {
+      scheduleChatConnectNow();
+    }
+  }
+
+  function isIceConnected(iceState) {
+    return iceState === "connected" || iceState === "completed";
   }
 
   async function unlockAudioOutput() {
@@ -715,6 +809,10 @@
     return `${PEER_PREFIX}-${state.roomHash}-${person}`;
   }
 
+  function isCaller() {
+    return state.me === CALLER_PERSON;
+  }
+
   function randomToken() {
     const bytes = new Uint8Array(8);
     crypto.getRandomValues(bytes);
@@ -741,6 +839,8 @@
   function endCall(message) {
     state.lifted = false;
     state.connected = false;
+    state.callNegotiating = false;
+    state.remoteStream = null;
     cleanup();
     state.takeoverAttempted = false;
     elements.callButton.classList.remove("active");
@@ -754,6 +854,8 @@
   function failCall(statusText, hintText) {
     state.lifted = false;
     state.connected = false;
+    state.callNegotiating = false;
+    state.remoteStream = null;
     cleanup();
     state.takeoverAttempted = false;
     elements.callButton.classList.remove("active");
@@ -781,6 +883,8 @@
       state.activeCall.close();
       state.activeCall = null;
     }
+    state.callNegotiating = false;
+    state.remoteStream = null;
 
     if (state.peer) {
       state.peer.destroy();
