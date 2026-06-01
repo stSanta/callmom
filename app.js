@@ -3,17 +3,33 @@
 
   const PEER_PREFIX = "call-mom-v1";
   const RETRY_DELAY_MS = 2400;
+  const TAKEOVER_TIMEOUT_MS = 7000;
+  const TAKEOVER_RETRY_DELAY_MS = 1300;
+  const JITTER_BUFFER_TARGET_SECONDS = 0.8;
   const ICE_SERVERS = [
     { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" }
+    { urls: "stun:stun1.l.google.com:19302" },
+    {
+      urls: ["turn:eu-0.turn.peerjs.com:3478", "turn:us-0.turn.peerjs.com:3478"],
+      username: "peerjs",
+      credential: "peerjsp"
+    }
   ];
+  const CALL_OPTIONS = {
+    sdpTransform: preferResilientOpus
+  };
 
   const state = {
     me: null,
     other: null,
     key: "",
+    settingsConfirmed: false,
     lifted: false,
     connected: false,
+    takeoverAttempted: false,
+    takeoverPeer: null,
+    takeoverConnection: null,
+    takeoverTimer: null,
     peer: null,
     localStream: null,
     activeCall: null,
@@ -25,7 +41,9 @@
     lamp: document.querySelector("#lamp"),
     statusText: document.querySelector("#statusText"),
     roleText: document.querySelector("#roleText"),
-    setup: document.querySelector("#setup"),
+    setupDialog: document.querySelector("#setupDialog"),
+    setupForm: document.querySelector("#setupForm"),
+    setupSubmit: document.querySelector("#setupSubmit"),
     secretKey: document.querySelector("#secretKey"),
     personButtons: Array.from(document.querySelectorAll("[data-person]")),
     callButton: document.querySelector("#callButton"),
@@ -34,18 +52,23 @@
   };
 
   const params = readParams();
-  const storedKey = localStorage.getItem("callMomKey") || "";
   const storedPerson = localStorage.getItem("callMomPerson") || "";
 
-  elements.secretKey.value = params.key || storedKey;
+  elements.secretKey.value = params.key || "";
   choosePerson(params.me || storedPerson, false);
   refreshSetupState();
+  openSetup("Проверьте абонента и код связи.");
 
   elements.secretKey.addEventListener("input", refreshSetupState);
 
+  elements.setupForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    confirmSetup();
+  });
+
   elements.personButtons.forEach((button) => {
     button.addEventListener("click", () => {
-      choosePerson(button.dataset.person, true);
+      choosePerson(button.dataset.person, false);
       refreshSetupState();
     });
   });
@@ -98,21 +121,54 @@
   function refreshSetupState() {
     state.key = elements.secretKey.value.trim();
 
-    if (state.key) {
-      localStorage.setItem("callMomKey", state.key);
-    }
-
     const ready = Boolean(state.me && state.key);
-    elements.callButton.disabled = !ready;
-    elements.setup.classList.toggle("hidden", ready);
+    elements.setupSubmit.disabled = !ready;
+    elements.callButton.disabled = !canCall();
 
     if (!ready) {
       setStatus("idle", "Нужны абонент и код связи");
       elements.hint.textContent = "Один код связи должен быть одинаковым на двух устройствах.";
+    } else if (!state.settingsConfirmed) {
+      setStatus("idle", "Проверьте настройки");
+      elements.hint.textContent = "Подтвердите абонента и код связи перед звонком.";
     } else if (!state.lifted) {
       setStatus("idle", "Готово");
       elements.hint.textContent = "Нажмите трубку. Второй абонент делает то же самое на своей странице.";
     }
+  }
+
+  function confirmSetup() {
+    if (!state.me || !state.key) {
+      refreshSetupState();
+      return;
+    }
+
+    localStorage.setItem("callMomPerson", state.me);
+    state.takeoverAttempted = false;
+    state.settingsConfirmed = true;
+    closeSetup();
+    refreshSetupState();
+  }
+
+  function openSetup(message) {
+    state.settingsConfirmed = false;
+    elements.setupDialog.hidden = false;
+    elements.callButton.disabled = true;
+    refreshSetupState();
+    elements.hint.textContent = message;
+
+    window.requestAnimationFrame(() => {
+      elements.secretKey.focus();
+      elements.secretKey.select();
+    });
+  }
+
+  function closeSetup() {
+    elements.setupDialog.hidden = true;
+  }
+
+  function canCall() {
+    return Boolean(state.settingsConfirmed && state.me && state.key && !state.lifted);
   }
 
   async function liftHandset() {
@@ -129,8 +185,9 @@
     state.roomHash = await shortHash(state.key);
 
     elements.callButton.classList.add("active");
+    elements.callButton.disabled = false;
     elements.callButton.setAttribute("aria-label", "Положить трубку");
-    elements.setup.classList.add("hidden");
+    closeSetup();
     setStatus("waiting", "Запрашиваем микрофон");
     elements.hint.textContent = "Разрешите доступ к микрофону, затем дождитесь второго абонента.";
 
@@ -151,7 +208,10 @@
 
     state.peer = new Peer(peerId, {
       debug: 1,
-      config: { iceServers: ICE_SERVERS }
+      config: {
+        iceServers: ICE_SERVERS,
+        iceCandidatePoolSize: 4
+      }
     });
 
     state.peer.on("open", () => {
@@ -169,6 +229,10 @@
       attachCall(call, true);
     });
 
+    state.peer.on("connection", (connection) => {
+      attachControlConnection(connection);
+    });
+
     state.peer.on("disconnected", () => {
       if (state.lifted && !state.connected) {
         setStatus("waiting", "Восстанавливаем сигналинг");
@@ -179,7 +243,14 @@
     state.peer.on("error", (error) => {
       console.error(error);
       if (String(error.type) === "unavailable-id") {
-        failCall("Этот абонент уже открыт в другой вкладке", "Закройте лишнюю вкладку или обновите страницу через несколько секунд.");
+        if (!state.takeoverAttempted) {
+          startTakeover().catch((takeoverError) => {
+            console.error(takeoverError);
+            failCall("Абонент занят на другом устройстве", "Старая вкладка не освободила линию. Закройте ее или подождите минуту и попробуйте снова.");
+          });
+        } else {
+          failCall("Абонент занят на другом устройстве", "Старая вкладка еще держит линию. Закройте ее или подождите минуту и попробуйте снова.");
+        }
         return;
       }
 
@@ -210,7 +281,7 @@
       return;
     }
 
-    const call = state.peer.call(buildPeerId(state.other), state.localStream);
+    const call = state.peer.call(buildPeerId(state.other), state.localStream, CALL_OPTIONS);
     attachCall(call, false);
     scheduleDial();
   }
@@ -222,7 +293,7 @@
     }
 
     if (incoming) {
-      call.answer(state.localStream);
+      call.answer(state.localStream, CALL_OPTIONS);
     }
 
     state.activeCall = call;
@@ -230,6 +301,7 @@
     call.on("stream", (remoteStream) => {
       state.connected = true;
       window.clearTimeout(state.retryTimer);
+      tuneReceiverBuffer(call);
       elements.remoteAudio.srcObject = remoteStream;
       elements.remoteAudio.play().catch(() => {
         elements.hint.textContent = "Нажмите трубку еще раз, если браузер не включил звук автоматически.";
@@ -240,11 +312,17 @@
 
     call.on("close", () => {
       if (state.lifted) {
+        const wasConnected = state.connected;
         state.connected = false;
         state.activeCall = null;
-        setStatus("waiting", "Соединение прервано");
-        elements.hint.textContent = "Оставьте страницу открытой: пробуем соединиться снова.";
-        scheduleDial();
+
+        if (wasConnected) {
+          endCall("Связь завершена. Для новой сессии проверьте абонента и код связи.");
+        } else {
+          setStatus("waiting", "Соединение прервано");
+          elements.hint.textContent = "Оставьте страницу открытой: пробуем соединиться снова.";
+          scheduleDial();
+        }
       }
     });
 
@@ -256,8 +334,184 @@
     });
   }
 
+  function attachControlConnection(connection) {
+    connection.on("data", async (message) => {
+      if (!message || message.type !== "takeover") {
+        return;
+      }
+
+      const expectedProof = await takeoverProof();
+      if (message.proof !== expectedProof) {
+        return;
+      }
+
+      if (connection.open) {
+        connection.send({ type: "takeover-ack" });
+      }
+
+      window.setTimeout(() => {
+        endCall("Эта вкладка отключена: абонент открыт в другом месте.");
+      }, 180);
+    });
+  }
+
+  async function startTakeover() {
+    state.takeoverAttempted = true;
+    destroyPeerOnly();
+    setStatus("waiting", "Освобождаем абонента");
+    elements.hint.textContent = "Нашли старую вкладку с этим абонентом. Просим ее положить трубку.";
+
+    const proof = await takeoverProof();
+    const takeoverId = `${PEER_PREFIX}-takeover-${state.roomHash}-${state.me}-${randomToken()}`;
+
+    await new Promise((resolve, reject) => {
+      let finished = false;
+
+      const finish = (error) => {
+        if (finished) {
+          return;
+        }
+
+        finished = true;
+        window.clearTimeout(state.takeoverTimer);
+        destroyTakeoverPeer();
+        error ? reject(error) : resolve();
+      };
+
+      state.takeoverTimer = window.setTimeout(() => {
+        finish(new Error("Takeover timed out"));
+      }, TAKEOVER_TIMEOUT_MS);
+
+      state.takeoverPeer = new Peer(takeoverId, {
+        debug: 1,
+        config: { iceServers: ICE_SERVERS }
+      });
+
+      state.takeoverPeer.on("open", () => {
+        state.takeoverConnection = state.takeoverPeer.connect(buildPeerId(state.me), {
+          reliable: true,
+          metadata: { type: "takeover" }
+        });
+
+        state.takeoverConnection.on("open", () => {
+          state.takeoverConnection.send({ type: "takeover", proof });
+        });
+
+        state.takeoverConnection.on("data", (message) => {
+          if (message && message.type === "takeover-ack") {
+            finish();
+          }
+        });
+
+        state.takeoverConnection.on("error", finish);
+        state.takeoverConnection.on("close", () => {
+          if (!finished) {
+            finish(new Error("Takeover connection closed"));
+          }
+        });
+      });
+
+      state.takeoverPeer.on("error", finish);
+    });
+
+    if (!state.lifted || !state.localStream) {
+      return;
+    }
+
+    setStatus("waiting", "Абонент освобожден");
+    elements.hint.textContent = "Пробуем занять линию на этом устройстве.";
+    window.setTimeout(() => {
+      if (state.lifted && state.localStream && !state.peer) {
+        createPeer();
+      }
+    }, TAKEOVER_RETRY_DELAY_MS);
+  }
+
+  function destroyPeerOnly() {
+    if (state.peer) {
+      state.peer.destroy();
+      state.peer = null;
+    }
+  }
+
+  function destroyTakeoverPeer() {
+    window.clearTimeout(state.takeoverTimer);
+    state.takeoverTimer = null;
+
+    if (state.takeoverConnection) {
+      state.takeoverConnection.close();
+      state.takeoverConnection = null;
+    }
+
+    if (state.takeoverPeer) {
+      state.takeoverPeer.destroy();
+      state.takeoverPeer = null;
+    }
+  }
+
+  function takeoverProof() {
+    return shortHash(`takeover:${state.key}`);
+  }
+
+  function tuneReceiverBuffer(call) {
+    const peerConnection = call && call.peerConnection;
+    if (!peerConnection || !peerConnection.getReceivers) {
+      return;
+    }
+
+    peerConnection.getReceivers().forEach((receiver) => {
+      const track = receiver.track;
+      if (track && track.kind === "audio" && "jitterBufferTarget" in receiver) {
+        try {
+          receiver.jitterBufferTarget = JITTER_BUFFER_TARGET_SECONDS;
+        } catch (error) {
+          console.debug("Audio jitter buffer target is not writable here", error);
+        }
+      }
+    });
+  }
+
+  function preferResilientOpus(sdp) {
+    const opusMatch = sdp.match(/^a=rtpmap:(\d+) opus\/48000\/2$/im);
+    if (!opusMatch) {
+      return sdp;
+    }
+
+    const payload = opusMatch[1];
+    const fmtpLine = new RegExp(`^a=fmtp:${payload} (.*)$`, "im");
+    const opusOptions = ["useinbandfec=1", "usedtx=1", "maxaveragebitrate=24000"];
+
+    if (fmtpLine.test(sdp)) {
+      return sdp.replace(fmtpLine, (line, values) => {
+        const existing = values
+          .split(";")
+          .map((value) => value.trim().toLowerCase())
+          .filter(Boolean);
+        const missing = opusOptions.filter((option) => {
+          const optionKey = option.split("=")[0].toLowerCase();
+          return !existing.some((value) => value.split("=")[0] === optionKey);
+        });
+
+        return missing.length ? `${line};${missing.join(";")}` : line;
+      });
+    }
+
+    return sdp.replace(
+      new RegExp(`^(a=rtpmap:${payload} opus\\/48000\\/2\\r?\\n)`, "im"),
+      `$1a=fmtp:${payload} ${opusOptions.join(";")}\r\n`
+    );
+  }
+
   function buildPeerId(person) {
     return `${PEER_PREFIX}-${state.roomHash}-${person}`;
+  }
+
+  function randomToken() {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes)
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
   }
 
   async function shortHash(value) {
@@ -276,29 +530,32 @@
   }
 
   function endCall(message) {
-    cleanup();
     state.lifted = false;
     state.connected = false;
+    cleanup();
+    state.takeoverAttempted = false;
     elements.callButton.classList.remove("active");
     elements.callButton.setAttribute("aria-label", "Снять трубку");
     elements.remoteAudio.srcObject = null;
-    refreshSetupState();
-    elements.hint.textContent = message || "Можно закрыть страницу или позвонить снова.";
+    openSetup(message || "Для новой сессии проверьте абонента и код связи.");
   }
 
   function failCall(statusText, hintText) {
-    cleanup();
     state.lifted = false;
     state.connected = false;
+    cleanup();
+    state.takeoverAttempted = false;
     elements.callButton.classList.remove("active");
     elements.callButton.setAttribute("aria-label", "Снять трубку");
     elements.remoteAudio.srcObject = null;
+    elements.callButton.disabled = !canCall();
     setStatus("error", statusText);
     elements.hint.textContent = hintText;
   }
 
   function cleanup() {
     window.clearTimeout(state.retryTimer);
+    destroyTakeoverPeer();
 
     if (state.activeCall) {
       state.activeCall.close();
