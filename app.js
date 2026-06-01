@@ -1,23 +1,17 @@
 (function () {
-  var PEER_PREFIX = "call-mom-simple-v1";
-  var RETRY_DELAY_MS = 2500;
-  var CHAT_RETRY_DELAY_MS = 3000;
+  var CONFIG = window.CALLMOM_CONFIG || {};
+  var PEER_PREFIX = "call-mom-server-relay-v1";
+  var POLL_INTERVAL_MS = 250;
+  var HELLO_INTERVAL_MS = 3000;
+  var TARGET_SAMPLE_RATE = 12000;
+  var CHUNK_MS = 250;
+  var CHUNK_SAMPLES = Math.floor(TARGET_SAMPLE_RATE * CHUNK_MS / 1000);
+  var JITTER_SECONDS = 0.45;
+  var MAX_PLAYBACK_LAG_SECONDS = 2.2;
+  var MAX_AUDIO_IN_FLIGHT = 2;
   var params = readParams();
-  var FORCE_RELAY = params.relay === "1";
-  var ICE_SERVERS = [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    {
-      urls: [
-        "turn:eu-0.turn.peerjs.com:3478?transport=udp",
-        "turn:eu-0.turn.peerjs.com:3478?transport=tcp",
-        "turn:us-0.turn.peerjs.com:3478?transport=udp",
-        "turn:us-0.turn.peerjs.com:3478?transport=tcp"
-      ],
-      username: "peerjs",
-      credential: "peerjsp"
-    }
-  ];
+  var SIGNAL_URL = CONFIG.signalingUrl || "./signal.php";
+  var AudioContextClass = window.AudioContext || window.webkitAudioContext;
 
   var state = {
     me: null,
@@ -27,12 +21,29 @@
     confirmed: false,
     lifted: false,
     connected: false,
-    peer: null,
+    sessionId: "",
+    remoteSession: "",
+    remoteHelloAt: 0,
+    signalAfter: 0,
     localStream: null,
-    activeCall: null,
-    chatConnection: null,
-    dialTimer: null,
-    chatTimer: null
+    audioContext: null,
+    inputSource: null,
+    captureNode: null,
+    muteGain: null,
+    captureSamples: [],
+    pollTimer: null,
+    helloTimer: null,
+    playbackAt: 0,
+    playbackSources: [],
+    audioSeq: 0,
+    lastRemoteAudioSeq: 0,
+    audioInFlight: 0,
+    audioTxBytes: 0,
+    audioRxBytes: 0,
+    audioTxChunks: 0,
+    audioRxChunks: 0,
+    audioDropped: 0,
+    textReady: false
   };
 
   var elements = {
@@ -51,6 +62,7 @@
     chatForm: document.getElementById("chatForm"),
     chatInput: document.getElementById("chatInput"),
     chatSend: document.getElementById("chatSend"),
+    copyLogButton: document.getElementById("copyLogButton"),
     debugInfo: document.getElementById("debugInfo")
   };
 
@@ -58,16 +70,17 @@
     peerId: "",
     peerOpen: false,
     peerError: "",
+    server: "нет",
+    signaling: "нет",
     mic: "нет",
     localAudio: "нет",
     remoteAudio: "нет",
     audioPlay: "нет",
     call: "нет",
-    ice: "нет",
     chat: "нет"
   };
 
-  document.documentElement.setAttribute("data-peer-loaded", window.Peer ? "true" : "false");
+  document.documentElement.setAttribute("data-peer-loaded", AudioContextClass ? "server-relay" : "false");
 
   init();
 
@@ -105,7 +118,15 @@
       sendChatMessage();
     });
 
-    window.addEventListener("beforeunload", cleanup);
+    elements.copyLogButton.addEventListener("click", copyDebugLog);
+
+    window.addEventListener("beforeunload", function () {
+      if (state.lifted) {
+        sendEnvelope("bye", { session: state.sessionId }, "all");
+      }
+      cleanup();
+    });
+
     refreshSetupState();
     updateDebug();
   }
@@ -197,27 +218,49 @@
   }
 
   function startCall() {
-    if (!window.Peer) {
-      failCall("PeerJS не загрузился", "Проверьте интернет и обновите страницу.");
+    if (!AudioContextClass) {
+      failCall("Web Audio не поддерживается", "Нужен браузер с Web Audio и доступом к микрофону.");
       return;
     }
 
     state.lifted = true;
     state.connected = false;
-    state.roomHash = hashString(state.key);
+    state.sessionId = createSessionId();
+    state.remoteSession = "";
+    state.remoteHelloAt = 0;
+    state.signalAfter = 0;
+    state.captureSamples = [];
+    state.playbackAt = 0;
+    state.playbackSources = [];
+    state.audioSeq = 0;
+    state.lastRemoteAudioSeq = 0;
+    state.audioInFlight = 0;
+    state.audioTxBytes = 0;
+    state.audioRxBytes = 0;
+    state.audioTxChunks = 0;
+    state.audioRxChunks = 0;
+    state.audioDropped = 0;
+    state.textReady = false;
+    debug.peerId = buildPeerId(state.me);
+    debug.peerOpen = false;
+    debug.peerError = "";
+    debug.server = "подключаем";
+    debug.signaling = "подключаем";
     debug.mic = "запрашиваем";
     debug.localAudio = "нет";
     debug.remoteAudio = "нет";
     debug.audioPlay = "нет";
-    debug.call = "нет";
-    debug.ice = "нет";
+    debug.call = "серверное реле";
     debug.chat = "нет";
+
     resetChat();
     updateDebug();
     setButtonLifted(true);
     closeSetup();
     setStatus("waiting", "Запрашиваем микрофон");
-    elements.hint.textContent = "Разрешите микрофон и дождитесь второго абонента.";
+    elements.hint.textContent = "Разрешите микрофон. Связь будет идти через сервер, с задержкой.";
+
+    ensureAudioContext();
 
     getAudioStream()
       .then(function (stream) {
@@ -225,7 +268,8 @@
         debug.mic = "разрешен";
         debug.localAudio = describeTracks(stream.getAudioTracks());
         updateDebug();
-        createPeer();
+        startCapture(stream);
+        startRelay();
       })
       .catch(function (error) {
         console.error(error);
@@ -264,248 +308,510 @@
     });
   }
 
-  function createPeer() {
-    var peerId = buildPeerId(state.me);
-    debug.peerId = peerId;
-    debug.peerOpen = false;
-    debug.peerError = "";
-    updateDebug();
-
-    state.peer = new Peer(peerId, {
-      debug: 0,
-      config: {
-        iceServers: ICE_SERVERS,
-        iceTransportPolicy: FORCE_RELAY ? "relay" : "all",
-        sdpSemantics: "unified-plan"
-      }
-    });
-
-    state.peer.on("open", function () {
-      debug.peerOpen = true;
-      updateDebug();
-      setStatus("waiting", "Ждем второго абонента");
-      elements.hint.textContent = "Связь включена. Зеленая лампочка загорится после соединения.";
-      dialNow();
-      connectChatNow();
-    });
-
-    state.peer.on("call", function (call) {
-      if (!state.lifted || !state.localStream) {
-        call.close();
-        return;
-      }
-      attachCall(call, true);
-    });
-
-    state.peer.on("connection", attachChatConnection);
-
-    state.peer.on("error", function (error) {
-      console.error(error);
-      debug.peerError = error.type ? error.type : String(error);
-      updateDebug();
-      if (String(error.type) === "unavailable-id") {
-        failCall("Абонент уже открыт", "Закройте старую вкладку этого абонента и попробуйте снова.");
-        return;
-      }
-
-      if (state.lifted && !state.connected) {
-        setStatus("waiting", "Второй абонент еще не на линии");
-        scheduleDial();
-        scheduleChatConnect();
-      }
-    });
-  }
-
-  function dialNow() {
-    clearTimeout(state.dialTimer);
-    dialOther();
-  }
-
-  function scheduleDial() {
-    clearTimeout(state.dialTimer);
-    if (!state.lifted || state.connected) {
-      return;
+  function ensureAudioContext() {
+    if (!state.audioContext) {
+      state.audioContext = new AudioContextClass();
     }
-    state.dialTimer = setTimeout(dialOther, RETRY_DELAY_MS);
+
+    if (state.audioContext.resume) {
+      state.audioContext.resume().catch(function () {});
+    }
+
+    return state.audioContext;
   }
 
-  function dialOther() {
-    if (!state.peer || !state.peer.open || !state.localStream || state.connected) {
-      scheduleDial();
+  function startCapture(stream) {
+    var context = ensureAudioContext();
+    var processorSize = 4096;
+
+    if (!context.createScriptProcessor || !context.createMediaStreamSource) {
+      failCall("Захват звука не поддерживается", "В этом браузере нет нужного Web Audio API.");
       return;
     }
 
-    attachCall(state.peer.call(buildPeerId(state.other), state.localStream), false);
-    scheduleDial();
-  }
+    state.inputSource = context.createMediaStreamSource(stream);
+    state.captureNode = context.createScriptProcessor(processorSize, 1, 1);
+    state.muteGain = context.createGain();
+    state.muteGain.gain.value = 0;
 
-  function attachCall(call, incoming) {
-    if (state.activeCall && state.connected) {
-      call.close();
-      return;
-    }
-
-    state.activeCall = call;
-    debug.call = incoming ? "входящий" : "исходящий";
-    updateDebug();
-
-    if (incoming) {
-      call.answer(state.localStream);
-    }
-
-    call.on("iceStateChanged", function (iceState) {
-      debug.ice = iceState;
-      updateDebug();
-    });
-
-    call.on("stream", function (remoteStream) {
-      state.connected = true;
-      clearTimeout(state.dialTimer);
-      elements.remoteAudio.srcObject = remoteStream;
-      elements.remoteAudio.muted = false;
-      elements.remoteAudio.volume = 1;
-      debug.remoteAudio = describeTracks(remoteStream.getAudioTracks());
-      updateDebug();
-      debug.audioPlay = "запуск";
-      updateDebug();
-      playRemoteAudio();
-      setStatus("live", "На линии");
-      elements.hint.textContent = "Можно говорить. Чтобы выйти, закройте страницу или нажмите красную трубку.";
-      addChatLine("system", "аудиосвязь установлена");
-    });
-
-    call.on("close", function () {
+    state.captureNode.onaudioprocess = function (event) {
       if (!state.lifted) {
         return;
       }
+      handleInputSamples(event.inputBuffer.getChannelData(0), context.sampleRate);
+    };
 
-      var wasConnected = state.connected;
-      state.connected = false;
-      state.activeCall = null;
-      debug.call = "закрыт";
-      updateDebug();
-
-      if (wasConnected) {
-        endCall("Связь завершена. Для новой сессии проверьте абонента и код связи.");
-      } else {
-        setStatus("waiting", "Соединение прервано");
-        elements.hint.textContent = "Пробуем соединиться снова.";
-        scheduleDial();
-      }
-    });
-
-    call.on("error", function (error) {
-      console.error(error);
-      debug.call = "ошибка";
-      debug.peerError = error.message || String(error);
-      updateDebug();
-      if (state.lifted && !state.connected) {
-        scheduleDial();
-      }
-    });
+    state.inputSource.connect(state.captureNode);
+    state.captureNode.connect(state.muteGain);
+    state.muteGain.connect(context.destination);
   }
 
-  function connectChatNow() {
-    clearTimeout(state.chatTimer);
-    connectChat();
-  }
+  function handleInputSamples(input, inputRate) {
+    var samples = downsample(input, inputRate, TARGET_SAMPLE_RATE);
+    var i;
 
-  function scheduleChatConnect() {
-    clearTimeout(state.chatTimer);
-    if (!state.lifted || hasOpenChat()) {
-      return;
-    }
-    state.chatTimer = setTimeout(connectChat, CHAT_RETRY_DELAY_MS);
-  }
-
-  function connectChat() {
-    if (!state.peer || !state.peer.open || hasOpenChat()) {
-      scheduleChatConnect();
-      return;
+    for (i = 0; i < samples.length; i += 1) {
+      state.captureSamples.push(samples[i]);
     }
 
-    attachChatConnection(state.peer.connect(buildPeerId(state.other), { reliable: true }));
-    scheduleChatConnect();
+    while (state.captureSamples.length >= CHUNK_SAMPLES) {
+      sendAudioChunk(state.captureSamples.splice(0, CHUNK_SAMPLES));
+    }
   }
 
-  function attachChatConnection(connection) {
-    if (state.chatConnection && state.chatConnection.open) {
-      connection.close();
-      return;
+  function downsample(input, inputRate, outputRate) {
+    var ratio;
+    var length;
+    var output;
+    var i;
+
+    if (inputRate === outputRate) {
+      output = new Float32Array(input.length);
+      output.set(input);
+      return output;
     }
 
-    state.chatConnection = connection;
-    debug.chat = "подключаем";
+    ratio = inputRate / outputRate;
+    length = Math.max(1, Math.floor(input.length / ratio));
+    output = new Float32Array(length);
+
+    for (i = 0; i < length; i += 1) {
+      output[i] = input[Math.min(input.length - 1, Math.floor(i * ratio))];
+    }
+
+    return output;
+  }
+
+  function startRelay() {
+    setStatus("waiting", "Синхронизируемся");
+    elements.hint.textContent = "Пропускаем старую очередь сервера и начинаем новую сессию.";
+
+    syncToNow()
+      .then(function () {
+        return sendHello();
+      })
+      .catch(function (error) {
+        debug.peerError = error.message || String(error);
+        updateDebug();
+      })
+      .then(function () {
+        pollRelay();
+        scheduleHello();
+        setStatus("waiting", "Ждем второго абонента");
+        elements.hint.textContent = "Текст будет работать через сервер. Голос идет кусками, возможна задержка.";
+      });
+  }
+
+  function syncToNow() {
+    var fallbackQuery = {
+      op: "pull",
+      room: state.roomHash,
+      me: state.me,
+      after: 2147483647,
+      t: String(Date.now())
+    };
+
+    debug.signaling = "sync";
     updateDebug();
 
-    connection.on("open", function () {
-      clearTimeout(state.chatTimer);
-      debug.chat = "открыт";
-      updateDebug();
-      enableChat(true);
-      addChatLine("system", "текстовая связь установлена");
-    });
-
-    connection.on("data", function (message) {
-      if (typeof message === "string") {
-        addChatLine("other", message);
-      }
-    });
-
-    connection.on("close", function () {
-      if (state.chatConnection === connection) {
-        state.chatConnection = null;
-        debug.chat = "закрыт";
+    return requestJson("GET", SIGNAL_URL + "?" + encodeQuery(fallbackQuery))
+      .then(function (response) {
+        state.signalAfter = response.lastId || 0;
+        debug.signaling = "ok";
+        debug.server = "ok";
         updateDebug();
-        enableChat(false);
-        if (state.lifted) {
-          addChatLine("system", "текстовая связь прервана");
-          scheduleChatConnect();
-        }
-      }
-    });
+      });
+  }
 
-    connection.on("error", function (error) {
-      console.error(error);
-      if (state.chatConnection === connection) {
-        state.chatConnection = null;
+  function scheduleHello() {
+    clearTimeout(state.helloTimer);
+    if (!state.lifted) {
+      return;
+    }
+
+    state.helloTimer = setTimeout(function () {
+      if (state.lifted) {
+        sendHello();
+        scheduleHello();
       }
-      debug.chat = "ошибка";
+    }, HELLO_INTERVAL_MS);
+  }
+
+  function sendHello() {
+    return sendEnvelope("hello", {
+      session: state.sessionId,
+      sampleRate: TARGET_SAMPLE_RATE
+    }, "all");
+  }
+
+  function pollRelay() {
+    clearTimeout(state.pollTimer);
+
+    if (!state.lifted) {
+      return;
+    }
+
+    pullMessages()
+      .then(function (messages) {
+        debug.peerOpen = true;
+        debug.signaling = "ok";
+        debug.server = "ok";
+        debug.peerError = "";
+        if (!state.textReady) {
+          state.textReady = true;
+          debug.chat = "открыт";
+          enableChat(true);
+          addChatLine("system", "текстовая связь через сервер");
+        }
+        updateDebug();
+        handleMessages(messages || []);
+      })
+      .catch(function (error) {
+        debug.peerOpen = false;
+        debug.server = "ошибка";
+        debug.signaling = "ошибка";
+        debug.peerError = error.message || String(error);
+        debug.chat = "нет";
+        enableChat(false);
+        updateDebug();
+        setStatus("waiting", "Нет связи с сервером");
+        elements.hint.textContent = "signal.php не отвечает. Проверьте файл на сервере.";
+      })
+      .then(function () {
+        if (state.lifted) {
+          state.pollTimer = setTimeout(pollRelay, POLL_INTERVAL_MS);
+        }
+      });
+  }
+
+  function pullMessages() {
+    var query = {
+      op: "pull",
+      room: state.roomHash,
+      me: state.me,
+      after: state.signalAfter,
+      t: String(Date.now())
+    };
+
+    return requestJson("GET", SIGNAL_URL + "?" + encodeQuery(query)).then(function (response) {
+      if (response.lastId && response.lastId > state.signalAfter) {
+        state.signalAfter = response.lastId;
+      }
+      return response.messages || [];
+    });
+  }
+
+  function sendEnvelope(type, payload, to) {
+    if (!state.roomHash || !state.me) {
+      return Promise.resolve();
+    }
+
+    return requestJson("POST", SIGNAL_URL + "?op=push", {
+      room: state.roomHash,
+      from: state.me,
+      to: to || state.other,
+      type: type,
+      session: state.sessionId,
+      payload: payload || {}
+    }).then(function (response) {
+      debug.peerOpen = true;
+      debug.signaling = "ok";
+      debug.server = "ok";
+      updateDebug();
+      return response;
+    }).catch(function (error) {
+      debug.peerOpen = false;
+      debug.server = "ошибка";
+      debug.signaling = "ошибка";
       debug.peerError = error.message || String(error);
       updateDebug();
-      enableChat(false);
-      scheduleChatConnect();
+      throw error;
     });
+  }
+
+  function handleMessages(messages) {
+    var i;
+    var message;
+    var newestHello = null;
+
+    for (i = 0; i < messages.length; i += 1) {
+      message = messages[i];
+      if (!isRemoteMessage(message)) {
+        continue;
+      }
+
+      if (message.type === "hello" && (!newestHello || message.createdAt > newestHello.createdAt)) {
+        newestHello = message;
+      }
+    }
+
+    if (newestHello) {
+      acceptRemoteHello(newestHello);
+    }
+
+    for (i = 0; i < messages.length; i += 1) {
+      message = messages[i];
+      if (!isRemoteMessage(message)) {
+        continue;
+      }
+
+      if (message.type === "hello") {
+        continue;
+      }
+
+      if (message.type === "bye") {
+        addChatLine("system", "второй абонент положил трубку");
+        continue;
+      }
+
+      if (message.type === "text") {
+        acceptRemoteSessionFromMessage(message);
+        receiveTextMessage(message.payload || {});
+      } else if (message.type === "audio") {
+        if (!acceptRemoteSessionFromMessage(message)) {
+          continue;
+        }
+        receiveAudioChunk(message.payload || {});
+      }
+    }
+  }
+
+  function isRemoteMessage(message) {
+    if (!message || message.from === state.me) {
+      return false;
+    }
+
+    if (message.to && message.to !== state.me && message.to !== "all") {
+      return false;
+    }
+
+    return true;
+  }
+
+  function acceptRemoteHello(message) {
+    if (message.session && message.session !== state.remoteSession) {
+      state.remoteSession = message.session;
+      state.remoteHelloAt = message.createdAt || Date.now();
+      state.lastRemoteAudioSeq = 0;
+      state.playbackAt = 0;
+      stopScheduledAudio();
+      debug.remoteAudio = "ждем аудио";
+    }
+
+    if (!state.connected) {
+      state.connected = true;
+      setStatus("live", "На линии через сервер");
+      elements.hint.textContent = "Можно говорить. Задержка нормальна для серверного режима.";
+      addChatLine("system", "второй абонент на линии");
+    }
+
+    debug.call = "серверное реле";
+    updateDebug();
+  }
+
+  function acceptRemoteSessionFromMessage(message) {
+    if (!message.session) {
+      return false;
+    }
+
+    if (!state.remoteSession) {
+      state.remoteSession = message.session;
+      state.remoteHelloAt = message.createdAt || Date.now();
+      state.lastRemoteAudioSeq = 0;
+      state.playbackAt = 0;
+      stopScheduledAudio();
+    }
+
+    return message.session === state.remoteSession;
+  }
+
+  function sendAudioChunk(samples) {
+    var pcm;
+    var payload;
+
+    if (!state.lifted || !state.remoteSession || state.audioInFlight >= MAX_AUDIO_IN_FLIGHT) {
+      state.audioDropped += 1;
+      updateDebug();
+      return;
+    }
+
+    pcm = encodePcmBase64(samples);
+    payload = {
+      session: state.sessionId,
+      seq: state.audioSeq += 1,
+      sampleRate: TARGET_SAMPLE_RATE,
+      channel: talkChannel(),
+      pcm: pcm
+    };
+
+    state.audioInFlight += 1;
+    sendEnvelope("audio", payload, state.other)
+      .then(function () {
+        state.audioTxChunks += 1;
+        state.audioTxBytes += Math.floor(pcm.length * 3 / 4);
+        updateDebug();
+      })
+      .catch(function () {
+        state.audioDropped += 1;
+        updateDebug();
+      })
+      .then(function () {
+        state.audioInFlight = Math.max(0, state.audioInFlight - 1);
+        updateDebug();
+      });
+  }
+
+  function receiveAudioChunk(payload) {
+    var samples;
+    var seq = Number(payload.seq) || 0;
+    var sampleRate = Number(payload.sampleRate) || TARGET_SAMPLE_RATE;
+
+    if (!payload.pcm || seq && seq <= state.lastRemoteAudioSeq) {
+      return;
+    }
+
+    if (seq) {
+      state.lastRemoteAudioSeq = seq;
+    }
+
+    samples = decodePcmBase64(payload.pcm);
+    state.audioRxChunks += 1;
+    state.audioRxBytes += samples.length * 2;
+    debug.remoteAudio = (payload.channel || "remote") + " " + sampleRate + " Hz pcm";
+    debug.audioPlay = "queue";
+    playSamples(samples, sampleRate);
+    updateDebug();
+  }
+
+  function playSamples(samples, sampleRate) {
+    var context = ensureAudioContext();
+    var buffer = context.createBuffer(1, samples.length, sampleRate);
+    var source = context.createBufferSource();
+    var startAt;
+    var lag;
+
+    buffer.getChannelData(0).set(samples);
+    source.buffer = buffer;
+    source._callMomDone = false;
+    source.onended = function () {
+      source._callMomDone = true;
+    };
+
+    if (context.resume) {
+      context.resume().catch(function () {});
+    }
+
+    cleanupPlaybackSources();
+    lag = state.playbackAt ? state.playbackAt - context.currentTime : 0;
+    if (lag > MAX_PLAYBACK_LAG_SECONDS) {
+      stopScheduledAudio();
+      state.playbackAt = 0;
+      state.audioDropped += 1;
+      debug.audioPlay = "cut backlog";
+      updateDebug();
+    }
+
+    if (!state.playbackAt || state.playbackAt < context.currentTime) {
+      state.playbackAt = context.currentTime + JITTER_SECONDS;
+    }
+
+    startAt = state.playbackAt;
+    connectSourceToMonoOutput(source, context);
+    source.start(startAt);
+    state.playbackSources.push(source);
+    state.playbackAt = startAt + buffer.duration;
+    debug.audioPlay = "ok";
+  }
+
+  function connectSourceToMonoOutput(source, context) {
+    source.connect(context.destination);
+  }
+
+  function cleanupPlaybackSources() {
+    state.playbackSources = state.playbackSources.filter(function (source) {
+      return !source._callMomDone;
+    });
+  }
+
+  function stopScheduledAudio() {
+    state.playbackSources.forEach(function (source) {
+      try {
+        source.stop(0);
+      } catch (ignore) {}
+      source._callMomDone = true;
+    });
+    state.playbackSources = [];
+    state.playbackAt = 0;
+  }
+
+  function encodePcmBase64(samples) {
+    var binary = "";
+    var i;
+    var value;
+
+    for (i = 0; i < samples.length; i += 1) {
+      value = Math.max(-1, Math.min(1, samples[i]));
+      value = value < 0 ? value * 32768 : value * 32767;
+      value = Math.round(value);
+      binary += String.fromCharCode(value & 255, value >> 8 & 255);
+    }
+
+    return btoa(binary);
+  }
+
+  function decodePcmBase64(base64) {
+    var binary = atob(base64);
+    var length = Math.floor(binary.length / 2);
+    var samples = new Float32Array(length);
+    var i;
+    var value;
+
+    for (i = 0; i < length; i += 1) {
+      value = binary.charCodeAt(i * 2) | binary.charCodeAt(i * 2 + 1) << 8;
+      if (value >= 32768) {
+        value -= 65536;
+      }
+      samples[i] = value / 32768;
+    }
+
+    return samples;
   }
 
   function sendChatMessage() {
     var text = elements.chatInput.value.trim();
-    if (!text || !hasOpenChat()) {
+    if (!text || !state.textReady) {
       return;
     }
 
-    state.chatConnection.send(text);
-    addChatLine("me", text);
-    elements.chatInput.value = "";
+    sendEnvelope("text", {
+      session: state.sessionId,
+      text: text
+    }, state.other).then(function () {
+      addChatLine("me", text);
+      elements.chatInput.value = "";
+    }).catch(function (error) {
+      debug.peerError = error.message || String(error);
+      updateDebug();
+    });
   }
 
-  function hasOpenChat() {
-    return Boolean(state.chatConnection && state.chatConnection.open);
+  function receiveTextMessage(payload) {
+    if (typeof payload.text === "string" && payload.text) {
+      addChatLine("other", payload.text);
+    }
   }
 
   function enableChat(enabled) {
     elements.chatInput.disabled = !enabled;
     elements.chatSend.disabled = !enabled;
-    elements.chatInput.placeholder = enabled ? "короткое сообщение" : "ждем текстовую связь";
+    elements.chatInput.placeholder = enabled ? "короткое сообщение" : "ждем серверную связь";
   }
 
   function resetChat() {
-    clearTimeout(state.chatTimer);
-    state.chatConnection = null;
     debug.chat = "нет";
     enableChat(false);
     elements.chatLog.innerHTML = "";
-    addChatLine("system", "текстовая связь ждет второго абонента");
+    addChatLine("system", "текстовая связь пойдет через сервер");
   }
 
   function addChatLine(kind, text) {
@@ -520,6 +826,9 @@
   }
 
   function endCall(message) {
+    if (state.lifted) {
+      sendEnvelope("bye", { session: state.sessionId }, "all");
+    }
     state.lifted = false;
     state.connected = false;
     cleanup();
@@ -538,24 +847,30 @@
   }
 
   function cleanup() {
-    clearTimeout(state.dialTimer);
-    clearTimeout(state.chatTimer);
+    clearTimeout(state.pollTimer);
+    clearTimeout(state.helloTimer);
 
-    if (state.activeCall) {
-      state.activeCall.close();
-      state.activeCall = null;
+    if (state.captureNode) {
+      state.captureNode.onaudioprocess = null;
+      try {
+        state.captureNode.disconnect();
+      } catch (ignore) {}
+      state.captureNode = null;
     }
 
-    if (state.chatConnection) {
-      state.chatConnection.close();
-      state.chatConnection = null;
+    if (state.inputSource) {
+      try {
+        state.inputSource.disconnect();
+      } catch (ignore) {}
+      state.inputSource = null;
     }
 
-    if (state.peer) {
-      state.peer.destroy();
-      state.peer = null;
+    if (state.muteGain) {
+      try {
+        state.muteGain.disconnect();
+      } catch (ignore) {}
+      state.muteGain = null;
     }
-    debug.peerOpen = false;
 
     if (state.localStream) {
       state.localStream.getTracks().forEach(function (track) {
@@ -563,17 +878,16 @@
       });
       state.localStream = null;
     }
-    debug.localAudio = "нет";
 
-    if (elements.remoteAudio.srcObject) {
-      elements.remoteAudio.srcObject.getTracks().forEach(function (track) {
-        track.stop();
-      });
-      elements.remoteAudio.srcObject = null;
-    }
+    state.captureSamples = [];
+    state.audioInFlight = 0;
+    state.textReady = false;
+    debug.localAudio = "нет";
     debug.remoteAudio = "нет";
     debug.audioPlay = "нет";
-
+    debug.peerOpen = false;
+    debug.server = "нет";
+    debug.signaling = "нет";
     enableChat(false);
     updateDebug();
   }
@@ -593,41 +907,50 @@
     return PEER_PREFIX + "-" + state.roomHash + "-" + person;
   }
 
+  function talkChannel() {
+    return state.me === "1" ? "left" : "right";
+  }
+
+  function listenChannel() {
+    return state.me === "1" ? "right" : "left";
+  }
+
+  function channelDescription() {
+    if (!state.me) {
+      return "нет";
+    }
+
+    return "передаю " + talkChannel() + ", принимаю " + listenChannel() + ", слушаю моно";
+  }
+
   function hashString(text) {
     var hash = 2166136261;
-    for (var i = 0; i < text.length; i += 1) {
+    var i;
+    for (i = 0; i < text.length; i += 1) {
       hash ^= text.charCodeAt(i);
       hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
     }
     return (hash >>> 0).toString(16);
   }
 
-  function playRemoteAudio() {
-    var result;
-    try {
-      result = elements.remoteAudio.play();
-    } catch (error) {
-      console.warn("Audio playback was blocked", error);
-      debug.audioPlay = "ошибка: " + (error.message || String(error));
-      updateDebug();
-      return;
+  function createSessionId() {
+    var random = "";
+    var values;
+    var i;
+
+    if (window.crypto && window.crypto.getRandomValues) {
+      values = new Uint32Array(2);
+      window.crypto.getRandomValues(values);
+      random = values[0].toString(16) + values[1].toString(16);
+    } else {
+      random = Math.floor(Math.random() * 0x100000000).toString(16);
     }
 
-    if (result && result.then) {
-      result
-        .then(function () {
-          debug.audioPlay = "ok";
-          updateDebug();
-        })
-        .catch(function (error) {
-          console.warn("Audio playback was blocked", error);
-          debug.audioPlay = "ошибка: " + (error.message || String(error));
-          updateDebug();
-        });
-    } else {
-      debug.audioPlay = "ok";
-      updateDebug();
+    for (i = random.length; i < 12; i += 1) {
+      random += "0";
     }
+
+    return Date.now().toString(36) + "-" + random.slice(0, 12);
   }
 
   function describeTracks(tracks) {
@@ -652,20 +975,120 @@
     }
 
     elements.debugInfo.textContent = [
-      "версия: v6-relay-test",
-      "relay: " + (FORCE_RELAY ? "forced" : "auto"),
+      "версия: v23-pull-sync-relay",
+      "режим: серверное двухканальное реле",
+      "signalingUrl: " + SIGNAL_URL,
       "абонент: " + (state.me || "не выбран"),
+      "каналы: " + channelDescription(),
       "peerId: " + (debug.peerId || "нет"),
       "peer: " + (debug.peerOpen ? "open" : "closed"),
+      "сервер: " + debug.server,
+      "сигналинг: " + debug.signaling,
       "микрофон: " + debug.mic,
       "локальный аудио: " + debug.localAudio,
       "звонок: " + debug.call,
-      "ice: " + debug.ice,
+      "ice: не используется",
+      "pc: не используется",
+      "маршрут: PHP channel relay",
+      "аудио rx: " + state.audioRxChunks + " чанков, " + state.audioRxBytes + " байт",
+      "аудио tx: " + state.audioTxChunks + " чанков, " + state.audioTxBytes + " байт, drop " + state.audioDropped,
       "входящий аудио: " + debug.remoteAudio,
       "audio.play: " + debug.audioPlay,
       "текст: " + debug.chat,
       "ошибка: " + (debug.peerError || "нет"),
       "браузер: " + navigator.userAgent
     ].join("\n");
+  }
+
+  function requestJson(method, url, body) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open(method, url, true);
+      xhr.setRequestHeader("Accept", "application/json");
+      if (method === "POST") {
+        xhr.setRequestHeader("Content-Type", "application/json");
+      }
+      xhr.onreadystatechange = function () {
+        var data;
+        if (xhr.readyState !== 4) {
+          return;
+        }
+
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(new Error("signal HTTP " + xhr.status + ": " + (xhr.responseText || "").slice(0, 80)));
+          return;
+        }
+
+        try {
+          data = JSON.parse(xhr.responseText || "{}");
+        } catch (error) {
+          reject(new Error("signal bad JSON: " + (xhr.responseText || "").slice(0, 80)));
+          return;
+        }
+
+        if (!data.ok) {
+          reject(new Error((data.error || "signal error") + " HTTP " + xhr.status));
+          return;
+        }
+
+        resolve(data);
+      };
+      xhr.onerror = function () {
+        reject(new Error("signal network"));
+      };
+      xhr.ontimeout = function () {
+        reject(new Error("signal timeout"));
+      };
+      xhr.timeout = 10000;
+      xhr.send(body ? JSON.stringify(body) : null);
+    });
+  }
+
+  function encodeQuery(values) {
+    var parts = [];
+    Object.keys(values).forEach(function (key) {
+      parts.push(encodeURIComponent(key) + "=" + encodeURIComponent(values[key]));
+    });
+    return parts.join("&");
+  }
+
+  function copyDebugLog() {
+    var text = elements.debugInfo ? elements.debugInfo.textContent : "";
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        elements.copyLogButton.textContent = "Скопировано";
+        setTimeout(resetCopyButton, 1200);
+      }).catch(function () {
+        fallbackCopy(text);
+      });
+      return;
+    }
+
+    fallbackCopy(text);
+  }
+
+  function fallbackCopy(text) {
+    var textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "readonly");
+    textarea.style.position = "fixed";
+    textarea.style.left = "-9999px";
+    document.body.appendChild(textarea);
+    textarea.select();
+
+    try {
+      document.execCommand("copy");
+      elements.copyLogButton.textContent = "Скопировано";
+    } catch (error) {
+      elements.copyLogButton.textContent = "Не скопировалось";
+    }
+
+    document.body.removeChild(textarea);
+    setTimeout(resetCopyButton, 1200);
+  }
+
+  function resetCopyButton() {
+    elements.copyLogButton.textContent = "Скопировать лог";
   }
 })();
