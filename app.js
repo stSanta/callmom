@@ -1,14 +1,17 @@
 (function () {
   var CONFIG = window.CALLMOM_CONFIG || {};
   var PEER_PREFIX = "call-mom-server-relay-v1";
-  var POLL_INTERVAL_MS = 250;
-  var HELLO_INTERVAL_MS = 3000;
-  var TARGET_SAMPLE_RATE = 12000;
-  var CHUNK_MS = 250;
+  var POLL_INTERVAL_MS = readConfigNumber(CONFIG.pollIntervalMs, 600, 300, 3000, true);
+  var WAIT_POLL_INTERVAL_MS = readConfigNumber(CONFIG.waitPollIntervalMs, 960, 500, 5000, true);
+  var HELLO_INTERVAL_MS = readConfigNumber(CONFIG.helloIntervalMs, 8000, 3000, 30000, true);
+  var TARGET_SAMPLE_RATE = readConfigNumber(CONFIG.sampleRate, 10000, 6000, 16000, true);
+  var CHUNK_MS = readConfigNumber(CONFIG.chunkMs, 750, 250, 1500, true);
   var CHUNK_SAMPLES = Math.floor(TARGET_SAMPLE_RATE * CHUNK_MS / 1000);
-  var JITTER_SECONDS = 0.45;
+  var JITTER_SECONDS = readConfigNumber(CONFIG.jitterSeconds, 1, 0.3, 3, false);
   var MAX_PLAYBACK_LAG_SECONDS = 2.2;
-  var MAX_AUDIO_IN_FLIGHT = 2;
+  var MAX_AUDIO_IN_FLIGHT = readConfigNumber(CONFIG.maxAudioInFlight, 1, 1, 3, true);
+  var AUDIO_CODEC = CONFIG.audioCodec === "pcm16" ? "pcm16" : "pcm8";
+  var SILENCE_RMS = readConfigNumber(CONFIG.silenceRms, 0.005, 0, 0.05, false);
   var params = readParams();
   var SIGNAL_URL = CONFIG.signalingUrl || "./signal.php";
   var DEFAULT_KEY = normalizeKey(CONFIG.defaultKey) || "1";
@@ -44,6 +47,7 @@
     audioTxChunks: 0,
     audioRxChunks: 0,
     audioDropped: 0,
+    audioSilenceSkipped: 0,
     textReady: false
   };
 
@@ -141,6 +145,16 @@
     }
 
     return String(value).trim();
+  }
+
+  function readConfigNumber(value, fallback, min, max, round) {
+    var number = Number(value);
+    if (!isFinite(number)) {
+      return fallback;
+    }
+
+    number = Math.max(min, Math.min(max, number));
+    return round ? Math.round(number) : number;
   }
 
   function configureFixedLine() {
@@ -249,6 +263,7 @@
     state.audioTxChunks = 0;
     state.audioRxChunks = 0;
     state.audioDropped = 0;
+    state.audioSilenceSkipped = 0;
     state.textReady = false;
     debug.peerId = buildPeerId(state.me);
     debug.peerOpen = false;
@@ -488,7 +503,7 @@
       })
       .then(function () {
         if (state.lifted) {
-          state.pollTimer = setTimeout(pollRelay, POLL_INTERVAL_MS);
+          state.pollTimer = setTimeout(pollRelay, state.connected ? POLL_INTERVAL_MS : WAIT_POLL_INTERVAL_MS);
         }
       });
   }
@@ -644,11 +659,18 @@
       return;
     }
 
+    if (isSilentChunk(samples)) {
+      state.audioSilenceSkipped += 1;
+      updateDebug();
+      return;
+    }
+
     pcm = encodePcmBase64(samples);
     payload = {
       session: state.sessionId,
       seq: state.audioSeq += 1,
       sampleRate: TARGET_SAMPLE_RATE,
+      codec: AUDIO_CODEC,
       channel: talkChannel(),
       pcm: pcm
     };
@@ -683,10 +705,10 @@
       state.lastRemoteAudioSeq = seq;
     }
 
-    samples = decodePcmBase64(payload.pcm);
+    samples = decodePcmBase64(payload.pcm, payload.codec);
     state.audioRxChunks += 1;
     state.audioRxBytes += samples.length * 2;
-    debug.remoteAudio = (payload.channel || "remote") + " " + sampleRate + " Hz pcm";
+    debug.remoteAudio = (payload.channel || "remote") + " " + sampleRate + " Hz " + (payload.codec || "pcm16");
     debug.audioPlay = "queue";
     playSamples(samples, sampleRate);
     updateDebug();
@@ -754,6 +776,14 @@
   }
 
   function encodePcmBase64(samples) {
+    if (AUDIO_CODEC === "pcm8") {
+      return encodePcm8Base64(samples);
+    }
+
+    return encodePcm16Base64(samples);
+  }
+
+  function encodePcm16Base64(samples) {
     var binary = "";
     var i;
     var value;
@@ -768,7 +798,29 @@
     return btoa(binary);
   }
 
-  function decodePcmBase64(base64) {
+  function encodePcm8Base64(samples) {
+    var binary = "";
+    var i;
+    var value;
+
+    for (i = 0; i < samples.length; i += 1) {
+      value = Math.max(-1, Math.min(1, samples[i]));
+      value = Math.round(value * 127 + 128);
+      binary += String.fromCharCode(Math.max(0, Math.min(255, value)));
+    }
+
+    return btoa(binary);
+  }
+
+  function decodePcmBase64(base64, codec) {
+    if (codec === "pcm8") {
+      return decodePcm8Base64(base64);
+    }
+
+    return decodePcm16Base64(base64);
+  }
+
+  function decodePcm16Base64(base64) {
     var binary = atob(base64);
     var length = Math.floor(binary.length / 2);
     var samples = new Float32Array(length);
@@ -784,6 +836,33 @@
     }
 
     return samples;
+  }
+
+  function decodePcm8Base64(base64) {
+    var binary = atob(base64);
+    var samples = new Float32Array(binary.length);
+    var i;
+
+    for (i = 0; i < binary.length; i += 1) {
+      samples[i] = (binary.charCodeAt(i) - 128) / 128;
+    }
+
+    return samples;
+  }
+
+  function isSilentChunk(samples) {
+    var sum = 0;
+    var i;
+
+    if (SILENCE_RMS <= 0 || !samples.length) {
+      return false;
+    }
+
+    for (i = 0; i < samples.length; i += 1) {
+      sum += samples[i] * samples[i];
+    }
+
+    return Math.sqrt(sum / samples.length) < SILENCE_RMS;
   }
 
   function sendChatMessage() {
@@ -988,8 +1067,9 @@
     }
 
     elements.debugInfo.textContent = [
-      "версия: v24-fixed-links",
+      "версия: v26-voice-plus",
       "режим: серверное двухканальное реле",
+      "экономия: poll " + POLL_INTERVAL_MS + "ms, wait " + WAIT_POLL_INTERVAL_MS + "ms, chunk " + CHUNK_MS + "ms, " + TARGET_SAMPLE_RATE + " Hz, " + AUDIO_CODEC,
       "signalingUrl: " + SIGNAL_URL,
       "абонент: " + (state.me || "не выбран"),
       "каналы: " + channelDescription(),
@@ -1004,7 +1084,7 @@
       "pc: не используется",
       "маршрут: PHP channel relay",
       "аудио rx: " + state.audioRxChunks + " чанков, " + state.audioRxBytes + " байт",
-      "аудио tx: " + state.audioTxChunks + " чанков, " + state.audioTxBytes + " байт, drop " + state.audioDropped,
+      "аудио tx: " + state.audioTxChunks + " чанков, " + state.audioTxBytes + " байт, drop " + state.audioDropped + ", silence " + state.audioSilenceSkipped,
       "входящий аудио: " + debug.remoteAudio,
       "audio.play: " + debug.audioPlay,
       "текст: " + debug.chat,
